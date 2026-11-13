@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Apply the current KDE Plasma color scheme to KDiff3 (native and Flatpak)."""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+FLATPAK_ID = "org.kde.kdiff3"
+RC_SECTION = "KDiff3 Options"
+
+
+def xdg_dir(env, default):
+    return Path(os.environ.get(env) or Path.home() / default)
+
+
+def parse_kconfig(path):
+    """Parse a KConfig ini file into {section: {key: value}}."""
+    data, section = {}, None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return data
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = line[1:-1]
+            data.setdefault(section, {})
+        elif section is not None and "=" in line:
+            key, _, value = line.partition("=")
+            data[section][key.strip()] = value.strip()
+    return data
+
+
+def find_scheme_file(name):
+    dirs = [xdg_dir("XDG_DATA_HOME", ".local/share")]
+    dirs += [Path(d) for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    for d in dirs:
+        path = d / "color-schemes" / f"{name}.colors"
+        if path.is_file():
+            return path
+    return None
+
+
+def load_kde_colors():
+    """Return (scheme name, {group: {key: value}}) for the active color scheme.
+
+    kdeglobals holds the applied colors (including accent color tweaks); the
+    scheme file is only used to fill in keys missing from kdeglobals.
+    """
+    kdeglobals = parse_kconfig(xdg_dir("XDG_CONFIG_HOME", ".config") / "kdeglobals")
+    name = kdeglobals.get("General", {}).get("ColorScheme", "BreezeLight")
+    scheme_file = find_scheme_file(name) or find_scheme_file("BreezeLight")
+    colors = {}
+    for source in (parse_kconfig(scheme_file) if scheme_file else {}, kdeglobals):
+        for group in ("View", "Selection"):
+            colors.setdefault(group, {}).update(source.get(f"Colors:{group}", {}))
+    return name, colors
+
+
+def parse_color(value):
+    if value.startswith("#") and len(value) == 7:
+        return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+    parts = value.split(",")
+    if len(parts) not in (3, 4):
+        raise ValueError(value)
+    return tuple(max(0, min(255, int(p))) for p in parts[:3])
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def luminance(c):
+    def lin(v):
+        v /= 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (lin(v) for v in c)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a, b):
+    hi, lo = sorted((luminance(a), luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def readable(fg, bgs, ratio=3.0):
+    """Move fg toward white (dark bg) or black (light bg) until it is readable on all bgs."""
+    target = (255, 255, 255) if luminance(bgs[0]) < 0.18 else (0, 0, 0)
+    for step in range(21):
+        c = mix(fg, target, step / 20)
+        if all(contrast(c, bg) >= ratio for bg in bgs):
+            return c
+    return target
+
+
+def build_kdiff3_colors(scheme):
+    def pick(group, key):
+        try:
+            return parse_color(scheme[group][key])
+        except (KeyError, ValueError):
+            sys.exit(f"error: cannot read Colors:{group}/{key} from the KDE color scheme")
+
+    fg, bg = pick("View", "ForegroundNormal"), pick("View", "BackgroundNormal")
+    sel = pick("Selection", "BackgroundNormal")
+    pos, neu, neg = (pick("View", k) for k in ("ForegroundPositive", "ForegroundNeutral", "ForegroundNegative"))
+
+    diff_bg = mix(bg, fg, 0.12)
+    cur_bg = mix(bg, sel, 0.15)
+    cur_diff_bg = mix(diff_bg, sel, 0.25)
+    text_bgs = (diff_bg, cur_diff_bg)
+
+    return {
+        "FgColor": fg,
+        "BgColor": bg,
+        "DiffBgColor": diff_bg,
+        "CurrentRangeBgColor": cur_bg,
+        "CurrentRangeDiffBgColor": cur_diff_bg,
+        "ColorA": readable(pick("View", "ForegroundLink"), text_bgs),
+        "ColorB": readable(pos, text_bgs),
+        "ColorC": readable(neu, text_bgs),
+        "ColorForConflict": readable(neg, text_bgs),
+        "ManualAlignmentRangeColor": mix(bg, neu, 0.35),
+        "NewestFileColor": pos,
+        "OldestFileColor": neg,
+        "MidAgeFileColor": neu,
+        "MissingFileColor": pick("View", "ForegroundInactive"),
+    }
+
+
+def print_colors(colors):
+    swatch = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    for key, (r, g, b) in colors.items():
+        line = f"  {key:<26}#{r:02x}{g:02x}{b:02x}"
+        if swatch:
+            line += f"  \033[48;2;{r};{g};{b}m    \033[0m"
+        print(line)
+
+
+def rc_path(kind):
+    """Return the kdiff3rc path for an installed KDiff3 variant, or None."""
+    if kind == "native":
+        rc = xdg_dir("XDG_CONFIG_HOME", ".config") / "kdiff3rc"
+        return rc if shutil.which("kdiff3") or rc.exists() else None
+    if shutil.which("flatpak"):
+        info = subprocess.run(["flatpak", "info", FLATPAK_ID], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if info.returncode == 0:
+            return Path.home() / ".var/app" / FLATPAK_ID / "config/kdiff3rc"
+    return None
+
+
+def kdiff3_running():
+    # Flatpak processes are visible from the host with the same name.
+    try:
+        return subprocess.run(["pgrep", "-x", "kdiff3"], stdout=subprocess.DEVNULL).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def update_section(text, section, values):
+    """Set key=value pairs inside [section], leaving every other line untouched."""
+    out, pending = [], dict(values)
+    in_section = found = False
+
+    def flush():
+        # Append keys not present yet, before the blank lines that end the section.
+        i = len(out)
+        while i and not out[i - 1].strip():
+            i -= 1
+        if i and not out[i - 1].endswith("\n"):
+            out[i - 1] += "\n"
+        out[i:i] = [f"{k}={v}\n" for k, v in pending.items()]
+        pending.clear()
+
+    for line in text.splitlines(keepends=True):
+        s = line.strip()
+        if s.startswith("["):
+            if in_section:
+                flush()
+            in_section = s == f"[{section}]"
+            found = found or in_section
+        elif in_section and "=" in s:
+            key = s.split("=", 1)[0].strip()
+            if key in values:
+                pending.pop(key, None)
+                line = f"{key}={values[key]}\n"
+        out.append(line)
+
+    if in_section:
+        flush()
+    if not found:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        if out:
+            out.append("\n")
+        out.append(f"[{section}]\n")
+        out += [f"{k}={v}\n" for k, v in values.items()]
+    return "".join(out)
+
+
+def apply(rc, colors):
+    values = {k: "%d,%d,%d" % c for k, c in colors.items()}
+    old = rc.read_text(encoding="utf-8", errors="surrogateescape") if rc.exists() else ""
+    new = update_section(old, RC_SECTION, values)
+    if new == old:
+        return f"{rc} (unchanged)"
+
+    backup = None
+    if rc.exists():
+        backup = rc.with_name(f"{rc.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(rc, backup)
+    else:
+        rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text(new, encoding="utf-8", errors="surrogateescape")
+    return f"{rc} (backup: {backup.name})" if backup else f"{rc} (created)"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("-t", "--target", choices=("all", "native", "flatpak"), default="all",
+                    help="KDiff3 installation to update (default: all)")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="only print the colors, do not write anything")
+    args = ap.parse_args()
+
+    name, scheme = load_kde_colors()
+    colors = build_kdiff3_colors(scheme)
+    print(f"Color scheme: {name}")
+    print_colors(colors)
+    if args.dry_run:
+        return 0
+
+    if kdiff3_running():
+        print("error: KDiff3 is running and would overwrite kdiff3rc on exit, close it first", file=sys.stderr)
+        return 1
+
+    found = False
+    for kind in ("native", "flatpak") if args.target == "all" else (args.target,):
+        rc = rc_path(kind)
+        if rc is None:
+            print(f"{kind + ':':<9}not installed")
+            continue
+        found = True
+        print(f"{kind + ':':<9}{apply(rc, colors)}")
+    return 0 if found else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
